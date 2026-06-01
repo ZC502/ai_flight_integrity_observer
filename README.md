@@ -271,6 +271,32 @@ ros2 run ai_flight_integrity_observer flight_integrity_node --ros-args \
 
 ---
 
+## CSV Failure Label Export
+
+The observer publishes flight execution-integrity events to `/diagnostics`.
+
+For ML / Sim2Real / AI-load regression workflows, the included CSV labeler converts those diagnostics into machine-readable failure labels:
+
+```bash
+ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-args \
+  -p output_csv:=flight_integrity_labels.csv
+```
+Example labels:
+
+```csv
+ros_time_sec,diagnostic_level_name,status,dominantCause,totalResidual,flightResidual,velocityTrackingResidual,gpsVioJumpMetric,setpointJitterMs
+1779800001.12,ERROR,RESYNCING,COMMAND_RESPONSE_MISMATCH,1.428000,1.428000,0.900000,0.000000,0.00
+1779800004.54,ERROR,RESYNCING,GPS_VIO_JUMP,3.210000,3.210000,0.000000,2.100000,0.00
+```
+These labels can be used for:
+- AI-load regression testing
+- Sim2Real failure mining
+- offboard setpoint failure datasets
+- OOD event detection
+- post-flight incident review
+
+---
+
 ## PX4 QoS Warning
 
 PX4 high-rate topics often use sensor-style QoS.
