@@ -27,6 +27,7 @@ setup(
         "console_scripts": [
             "flight_integrity_node = ai_flight_integrity_observer.flight_integrity_node:main",
             "synthetic_px4_publisher = ai_flight_integrity_observer.synthetic_px4_publisher:main",
+            "flight_diagnostics_to_csv_labeler = ai_flight_integrity_observer.flight_diagnostics_to_csv_labeler:main",
         ],
     },
 )
