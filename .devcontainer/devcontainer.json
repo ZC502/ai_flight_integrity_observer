@@ -1,18 +1,22 @@
 {
-  "name": "ai-flight-integrity-observer-ros2-humble",
+  "name": "AI Flight Integrity Observer - ROS 2 Humble",
   "build": {
-    "dockerfile": "Dockerfile"
+    "dockerfile": "Dockerfile",
+    "context": ".."
   },
   "remoteUser": "root",
-  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
   "customizations": {
     "vscode": {
       "extensions": [
         "ms-iot.vscode-ros",
         "ms-python.python",
-        "ms-vscode.cpptools"
-      ]
+        "ms-vscode.cpptools",
+        "mhutchie.git-graph"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
     }
   },
-  "postCreateCommand": "source /opt/ros/humble/setup.bash && python3 --version && ros2 --help >/dev/null"
+  "postCreateCommand": "rosdep update || true"
 }
