@@ -168,7 +168,7 @@ source ~/px4_ros2_ws/install/setup.bash
 ros2 run ai_flight_integrity_observer flight_integrity_node
 ```
 Expected startup log:
-```
+```Plaintext
 AI Flight Integrity Observer started | setpoint=/fmu/in/trajectory_setpoint | offboard_mode=/fmu/in/offboard_control_mode | odometry=/fmu/out/vehicle_odometry | diagnostics=/diagnostics
 ```
 **5. Terminal 2: Start the synthetic PX4 publisher**
@@ -258,7 +258,7 @@ ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-ar
   -p output_csv:=flight_integrity_labels.csv
 ```
 Inspect the CSV:
-```
+```Bash
 head -n 5 flight_integrity_labels.csv
 tail -f flight_integrity_labels.csv
 ```
