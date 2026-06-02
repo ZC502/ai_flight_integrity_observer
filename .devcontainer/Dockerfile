@@ -1,28 +1,22 @@
-FROM ros:humble-ros-base-jammy
-
-SHELL ["/bin/bash", "-c"]
+FROM osrf/ros:humble-desktop
 
 ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update && apt-get install -y \
     git \
-    curl \
-    wget \
     python3-pip \
     python3-colcon-common-extensions \
     python3-rosdep \
     python3-vcstool \
-    build-essential \
+    python3-argcomplete \
+    ros-humble-diagnostic-msgs \
+    ros-humble-std-msgs \
     && rm -rf /var/lib/apt/lists/*
 
-# rosdep may already be initialized in some apt-get update && apt-get install -y \
-    git \
-    curl \
-    wget \
-    python3-pip \
-    python3-colcon-common- ROS images.
 RUN rosdep init 2>/dev/null || true
-RUN rosdep update || true
 
-# Make ROS 2 available in every interactive shell.
-RUN echo "source /opt/ros/humble/setup.bash" >> /etc/bash.bashrc
+# Auto-source ROS 2 for interactive terminals.
+RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
+
+WORKDIR /workspaces
