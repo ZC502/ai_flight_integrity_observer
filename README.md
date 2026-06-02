@@ -1,7 +1,7 @@
 # AI Flight Integrity Observer
+>**A ROS 2 / PX4 runtime observer for flight execution integrity under AI and companion-compute load.**
 
-> **A ROS 2 / PX4 runtime observer for flight execution integrity under AI and companion-compute load.**
-> Quantify whether AI-generated offboard control intent is physically realized in vehicle response.
+**Quantify whether AI-generated offboard control intent is physically realized in vehicle response.**
 
 Modern drones increasingly rely on companion computers for:
 
@@ -29,14 +29,7 @@ This project does **not** intercept flight control.
 
 It observes whether offboard setpoints are physically realized by the vehicle, and exposes flight execution collapse through standard ROS 2 diagnostics.
 
-````text
-setpoint publish jitter
-stale trajectory commands
-delayed vehicle odometry
-estimator lag
-```
 GPS /Initial target:
-
 ```text
 /fmu/in/offboard_control_mode
 /fmu/in/trajectory_setpoint
@@ -44,7 +37,7 @@ GPS /Initial target:
         ↓
 /diagnostics
   ai_flight_integrity/flight_execution_integrity
-````
+```
 
 ---
 
@@ -96,15 +89,15 @@ It is a passive runtime observer.
 
 ---
 
-## Repository Layout
+### Repository Layout
 
 Expected package layout:
-
-```text
+```
 ai_flight_integrity_observer/
 ├── README.md
 ├── package.xml
 ├── setup.py
+├── setup.cfg
 ├── resource/
 │   └── ai_flight_integrity_observer
 ├── launch/
@@ -113,14 +106,18 @@ ai_flight_integrity_observer/
     ├── __init__.py
     ├── px4_qos.py
     ├── flight_integrity_node.py
-    └── synthetic_px4_publisher.py
+    ├── synthetic_px4_publisher.py
+    └── flight_diagnostics_to_csv_labeler.py
 ```
-
 Before building, make sure these files exist:
-
-```text
+```
+setup.cfg
 resource/ai_flight_integrity_observer
 ai_flight_integrity_observer/__init__.py
+```
+`setup.cfg` is required for ROS 2 `ament_python` console scripts. Without it, the package may build successfully, but `ros2 run` may report:
+```
+No executable found
 ```
 
 ---
@@ -129,74 +126,84 @@ ai_flight_integrity_observer/__init__.py
 
 This test does **not** require PX4 SITL, Gazebo, Micro XRCE-DDS Agent, or a real UAV.
 
-It only verifies that the observer, PX4-style messages, QoS, diagnostics, and fault profiles are wired correctly.
+It verifies that the observer, PX4-style messages, QoS, diagnostics, fault profiles, and CSV label export are wired correctly.
 
-### 1. Create a ROS 2 workspace
-
-```bash
+**1. Create a ROS 2 workspace**
+```
 mkdir -p ~/px4_ros2_ws/src
 cd ~/px4_ros2_ws/src
 ```
-
-### 2. Clone dependencies and this repository
-
-```bash
+**2. Clone dependencies and this repository**
+```
 git clone https://github.com/PX4/px4_msgs.git
 git clone https://github.com/ZC502/ai_flight_integrity_observer.git
 ```
-
 Make sure the `px4_msgs` branch matches the PX4 firmware / SITL version you plan to use later.
 
-### 3. Build
-
-```bash
+**3. Build**
+```
 cd ~/px4_ros2_ws
+
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install
+
+colcon build --symlink-install --merge-install
+
 source install/setup.bash
 ```
-
-### 4. Terminal 1: Start the observer
-
+Verify that the package and executables are visible:
 ```bash
+ros2 pkg list | grep ai_flight_integrity_observer
+ros2 pkg executables ai_flight_integrity_observer
+```
+Expected executables:
+```
+ai_flight_integrity_observer flight_integrity_node
+ai_flight_integrity_observer synthetic_px4_publisher
+ai_flight_integrity_observer flight_diagnostics_to_csv_labeler
+```
+**4. Terminal 1: Start the observer**
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
 ros2 run ai_flight_integrity_observer flight_integrity_node
 ```
-
-### 5. Terminal 2: Start the synthetic PX4 publisher
+Expected startup log:
+```
+AI Flight Integrity Observer started | setpoint=/fmu/in/trajectory_setpoint | offboard_mode=/fmu/in/offboard_control_mode | odometry=/fmu/out/vehicle_odometry | diagnostics=/diagnostics
+```
+**5. Terminal 2: Start the synthetic PX4 publisher**
 
 Normal mode:
-
-```bash
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
 ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
   -p profile:=normal
 ```
-
 Fault modes:
-
-```bash
-ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=setpoint_jitter
 ```
-
-```bash
 ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=command_response_mismatch
-```
-
-```bash
+  -p profile:=setpoint_jitter \
+  -p fault_duration_sec:=9999.0
 ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=gps_vio_jump
+  -p profile:=command_response_mismatch \
+  -p fault_duration_sec:=9999.0
+ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
+  -p profile:=gps_vio_jump \
+  -p fault_duration_sec:=9999.0
 ```
+Why `fault_duration_sec:=9999.0`?
 
-### 6. Terminal 3: Inspect diagnostics
+Short fault windows can end before you inspect `/diagnostics`. A long fault duration makes the failure state easier to observe in the terminal or dashboard.
 
-```bash
+**6. Terminal 3: Inspect diagnostics**
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
 ros2 topic echo /diagnostics --once --full-length
 ```
-
 A more compact diagnostic view:
-
-```bash
+```Bash
 ros2 topic echo /diagnostics --once --full-length \
 | awk '
 /message:/ {print}
@@ -207,6 +214,7 @@ ros2 topic echo /diagnostics --once --full-length \
 /- key: flightResidual$/ ||
 /- key: setpointJitterMs$/ ||
 /- key: velocityTrackingResidual$/ ||
+/- key: positionTrackingResidual$/ ||
 /- key: gpsVioJumpMetric$/ ||
 /- key: staleStreams$/ ||
 /- key: statsEvaluations$/ {
@@ -215,75 +223,47 @@ ros2 topic echo /diagnostics --once --full-length \
   print
 }'
 ```
-
 Expected results:
-
-```text
+```
 normal                    → OK    | GREEN: FLIGHT_ALIGNED
 setpoint_jitter           → ERROR | RESYNCING: SETPOINT_JITTER
-command_response_mismatch → ERROR | RESYNCING: COMMAND_RESPONSE_MISMATCH
+command_response_mismatch → ERROR | RESYNCING: COMMAND_RESPONSE_MISMATCH or POSITION_RESPONSE_MISMATCH
 gps_vio_jump              → ERROR | RESYNCING: GPS_VIO_JUMP
 ```
+Note on `command_response_mismatch`:
+
+During the active fault window, the vehicle velocity intentionally fails to track the setpoint, so the observer may report:
+```
+COMMAND_RESPONSE_MISMATCH
+```
+After the velocity recovers, the vehicle may still lag behind the setpoint position. In that case, the observer correctly reports:
+```
+POSITION_RESPONSE_MISMATCH
+```
+This means the observer is detecting the remaining physical execution error, not that the test failed.
 
 ---
 
-## Quick Start B: PX4 SITL Path
-
-The synthetic test is only the first smoke test.
-
-For real PX4 validation, you need:
-
-```text
-PX4 SITL
-Micro XRCE-DDS Agent
-ROS 2
-px4_msgs matching your PX4 version
-```
-
-The intended PX4-facing topics are:
-
-```text
-/fmu/in/offboard_control_mode
-/fmu/in/trajectory_setpoint
-/fmu/out/vehicle_odometry
-```
-
-Optional future input:
-
-```text
-/fmu/out/estimator_status
-```
-
-Once PX4 SITL and the DDS bridge are running, verify that odometry is visible:
-
-```bash
-ros2 topic echo /fmu/out/vehicle_odometry --once
-```
-
-Then run the observer:
-
-```bash
-ros2 run ai_flight_integrity_observer flight_integrity_node --ros-args \
-  -p trajectory_setpoint_topic:=/fmu/in/trajectory_setpoint \
-  -p offboard_control_mode_topic:=/fmu/in/offboard_control_mode \
-  -p vehicle_odometry_topic:=/fmu/out/vehicle_odometry
-```
-
----
-
-## CSV Failure Label Export
+### CSV Failure Label Export
 
 The observer publishes flight execution-integrity events to `/diagnostics`.
 
-For ML / Sim2Real / AI-load regression workflows, the included CSV labeler converts those diagnostics into machine-readable failure labels:
+For ML / Sim2Real / AI-load regression workflows, the included CSV labeler converts those diagnostics into machine-readable failure labels.
 
-```bash
+**Terminal 4: Start the CSV labeler**
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
 ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-args \
   -p output_csv:=flight_integrity_labels.csv
 ```
+Inspect the CSV:
+```
+head -n 5 flight_integrity_labels.csv
+tail -f flight_integrity_labels.csv
+```
 Example labels:
-
-```csv
+```
 ros_time_sec,diagnostic_level_name,status,dominantCause,totalResidual,flightResidual,velocityTrackingResidual,gpsVioJumpMetric,setpointJitterMs
 1779800001.12,ERROR,RESYNCING,COMMAND_RESPONSE_MISMATCH,1.428000,1.428000,0.900000,0.000000,0.00
 1779800004.54,ERROR,RESYNCING,GPS_VIO_JUMP,3.210000,3.210000,0.000000,2.100000,0.00
@@ -294,6 +274,50 @@ These labels can be used for:
 - offboard setpoint failure datasets
 - OOD event detection
 - post-flight incident review
+
+---
+
+### Quick Start B: PX4 SITL Path
+
+The synthetic test is only the first smoke test.
+
+For real PX4 validation, you need:
+```
+PX4 SITL
+Micro XRCE-DDS Agent
+ROS 2
+px4_msgs matching your PX4 version
+```
+The intended PX4-facing topics are:
+```
+/fmu/in/offboard_control_mode
+/fmu/in/trajectory_setpoint
+/fmu/out/vehicle_odometry
+```
+Optional future input:
+```
+/fmu/out/estimator_status
+```
+Once PX4 SITL and the DDS bridge are running, verify that odometry is visible:
+```
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
+
+ros2 topic echo /fmu/out/vehicle_odometry --once
+```
+Then run the observer:
+```
+ros2 run ai_flight_integrity_observer flight_integrity_node --ros-args \
+  -p trajectory_setpoint_topic:=/fmu/in/trajectory_setpoint \
+  -p offboard_control_mode_topic:=/fmu/in/offboard_control_mode \
+  -p vehicle_odometry_topic:=/fmu/out/vehicle_odometry
+```
+If no PX4 messages are received, check:
+```
+ros2 topic list | grep /fmu
+ros2 topic info /fmu/out/vehicle_odometry -v
+```
+PX4-facing subscriptions in this observer use Best Effort / Volatile QoS to avoid the common PX4 QoS mismatch trap.
 
 ---
 
