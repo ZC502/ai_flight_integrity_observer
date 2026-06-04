@@ -2,7 +2,7 @@
 """
 flight_integrity_node.py
 
-AI Flight Integrity Observer v0.1
+AI Flight Integrity Observer v0.1.2+
 
 Observe-only ROS 2 / PX4 flight execution-integrity observer.
 
@@ -61,14 +61,18 @@ except ImportError:
 
 try:
     from .flight_residual_core import (
+        TREND_DECREASING,
         classify_flight_integrity,
         infer_control_semantic_mode,
+        position_residual_trend,
         primary_residual_type_for_mode,
     )
 except ImportError:
     from flight_residual_core import (
+        TREND_DECREASING,
         classify_flight_integrity,
         infer_control_semantic_mode,
+        position_residual_trend,
         primary_residual_type_for_mode,
     )
 
@@ -266,14 +270,19 @@ class FlightIntegrityNode(Node):
         # Residual thresholds.
         self.declare_parameter("velocity_residual_warn_mps", 0.50)
         self.declare_parameter("velocity_residual_error_mps", 1.00)
+        # Mixed position+velocity mode only: absolute velocity residual
+        # fuse. This catches actuator/impact/propulsion failures even while
+        # position tracking is still in a permissible transient phase.
+        self.declare_parameter("critical_velocity_residual_mps", 4.00)
 
         self.declare_parameter("position_residual_warn_m", 1.50)
         self.declare_parameter("position_residual_error_m", 3.00)
 
-        # v0.1.1 mode-aware classification: in PX4 position mode,
+        # v0.1.2 mode-aware classification: in PX4 position mode,
         # decreasing position error during climb/descent is treated as a
         # tracking transient rather than a command-response failure.
         self.declare_parameter("position_residual_trend_deadband_m", 0.05)
+        self.declare_parameter("position_residual_stable_count_threshold", 5)
 
         self.declare_parameter("position_jump_min_m", 1.00)
         self.declare_parameter("position_jump_margin_m", 0.20)
@@ -360,6 +369,9 @@ class FlightIntegrityNode(Node):
         self.velocity_residual_error_mps = float(
             self.get_parameter("velocity_residual_error_mps").value
         )
+        self.critical_velocity_residual_mps = float(
+            self.get_parameter("critical_velocity_residual_mps").value
+        )
         self.position_residual_warn_m = float(
             self.get_parameter("position_residual_warn_m").value
         )
@@ -368,6 +380,9 @@ class FlightIntegrityNode(Node):
         )
         self.position_residual_trend_deadband_m = float(
             self.get_parameter("position_residual_trend_deadband_m").value
+        )
+        self.position_residual_stable_count_threshold = int(
+            self.get_parameter("position_residual_stable_count_threshold").value
         )
         self.position_jump_min_m = float(self.get_parameter("position_jump_min_m").value)
         self.position_jump_margin_m = float(
@@ -404,9 +419,12 @@ class FlightIntegrityNode(Node):
         self.last_estimator_status_msg: Optional[Any] = None
         self.last_estimator_status_receive_time: Optional[float] = None
 
-        # v0.1.1: track residual trend to avoid treating normal
-        # position-mode convergence as command-response failure.
+        # v0.1.2: track residual trend and a short non-decreasing
+        # counter to avoid diagnostic flicker during normal PX4
+        # position-mode convergence.
         self.prev_position_tracking_residual: Optional[float] = None
+        self.prev_control_semantic_mode: Optional[str] = None
+        self.position_residual_stable_count = 0
 
         self.setpoint_interval_ms = 0.0
         self.setpoint_jitter_ms = 0.0
@@ -803,6 +821,33 @@ class FlightIntegrityNode(Node):
             + stream_residual
         )
 
+        # v0.1.2 anti-chattering state:
+        # A single noisy frame should not immediately turn normal PX4
+        # position-mode convergence into RESYNCING. Count consecutive
+        # non-decreasing position residual frames, and reset the count
+        # whenever position error clearly decreases, returns below the
+        # warning threshold, or the control semantic mode changes.
+        trend_for_state, _ = position_residual_trend(
+            position_tracking_residual,
+            previous_position_tracking_residual,
+            deadband_m=self.position_residual_trend_deadband_m,
+        )
+
+        if (
+            previous_position_tracking_residual is None
+            or control_semantic_mode != self.prev_control_semantic_mode
+            or position_tracking_residual < self.position_residual_warn_m
+            or trend_for_state == TREND_DECREASING
+        ):
+            self.position_residual_stable_count = 0
+        else:
+            self.position_residual_stable_count = min(
+                self.position_residual_stable_count + 1,
+                1_000_000,
+            )
+
+        self.prev_control_semantic_mode = control_semantic_mode
+
         classification = classify_flight_integrity(
             offboard_active=offboard_active,
             control_semantic_mode=control_semantic_mode,
@@ -815,6 +860,8 @@ class FlightIntegrityNode(Node):
             setpoint_jitter_ms=self.setpoint_jitter_ms,
             previous_position_tracking_residual=previous_position_tracking_residual,
             position_trend_deadband_m=self.position_residual_trend_deadband_m,
+            position_residual_stable_count=self.position_residual_stable_count,
+            stable_count_threshold=self.position_residual_stable_count_threshold,
             setpoint_stale_warn_ms=self.setpoint_stale_warn_ms,
             setpoint_stale_error_ms=self.setpoint_stale_error_ms,
             offboard_stale_warn_ms=self.offboard_stale_warn_ms,
@@ -825,6 +872,7 @@ class FlightIntegrityNode(Node):
             setpoint_jitter_error_ms=self.setpoint_jitter_error_ms,
             velocity_residual_warn_mps=self.velocity_residual_warn_mps,
             velocity_residual_error_mps=self.velocity_residual_error_mps,
+            critical_velocity_residual_mps=self.critical_velocity_residual_mps,
             position_residual_warn_m=self.position_residual_warn_m,
             position_residual_error_m=self.position_residual_error_m,
         )
@@ -861,6 +909,8 @@ class FlightIntegrityNode(Node):
             position_residual_trend=classification.position_residual_trend,
             position_residual_delta=classification.position_residual_delta,
             tracking_transient=classification.tracking_transient,
+            position_residual_stable_count=classification.position_residual_stable_count,
+            critical_velocity_residual_mps=self.critical_velocity_residual_mps,
         )
 
     def _gps_vio_jump_metric(self) -> float:
@@ -978,6 +1028,8 @@ class FlightIntegrityNode(Node):
         position_residual_trend: str = "unknown",
         position_residual_delta: float = 0.0,
         tracking_transient: bool = False,
+        position_residual_stable_count: int = 0,
+        critical_velocity_residual_mps: Optional[float] = None,
     ) -> Dict[str, Any]:
         if dominant_cause_candidate is None:
             dominant_cause_candidate = dominant_cause
@@ -1002,6 +1054,15 @@ class FlightIntegrityNode(Node):
             "primaryResidualType": primary_residual_type,
             "positionResidualTrend": position_residual_trend,
             "positionResidualDelta": finite_or(position_residual_delta),
+            "positionResidualStableCount": int(max(position_residual_stable_count, 0)),
+            "positionResidualStableCountThreshold": int(
+                max(self.position_residual_stable_count_threshold, 1)
+            ),
+            "criticalVelocityResidualMps": finite_or(
+                self.critical_velocity_residual_mps
+                if critical_velocity_residual_mps is None
+                else critical_velocity_residual_mps
+            ),
             "trackingTransient": bool(tracking_transient),
 
             "setpointAgeMs": finite_or(setpoint_age_sec * 1000.0, -1.0),
@@ -1205,6 +1266,20 @@ class FlightIntegrityNode(Node):
             key_value("flightResidual", f"{finite_or(payload.get('flightResidual', 0.0)):.6f}"),
 
             key_value("offboardActive", str(bool(payload.get("offboardActive", False))).lower()),
+            key_value("controlSemanticMode", payload.get("controlSemanticMode", "UNKNOWN_MODE")),
+            key_value("primaryResidualType", payload.get("primaryResidualType", "unknown")),
+            key_value("positionResidualTrend", payload.get("positionResidualTrend", "unknown")),
+            key_value("positionResidualDelta", f"{finite_or(payload.get('positionResidualDelta', 0.0)):.6f}"),
+            key_value("positionResidualStableCount", payload.get("positionResidualStableCount", 0)),
+            key_value(
+                "positionResidualStableCountThreshold",
+                payload.get("positionResidualStableCountThreshold", self.position_residual_stable_count_threshold),
+            ),
+            key_value(
+                "criticalVelocityResidualMps",
+                f"{finite_or(payload.get('criticalVelocityResidualMps', self.critical_velocity_residual_mps)):.2f}",
+            ),
+            key_value("trackingTransient", str(bool(payload.get("trackingTransient", False))).lower()),
 
             key_value("setpointAgeMs", f"{finite_or(payload.get('setpointAgeMs', -1.0)):.2f}"),
             key_value("offboardModeAgeMs", f"{finite_or(payload.get('offboardModeAgeMs', -1.0)):.2f}"),
