@@ -59,6 +59,19 @@ try:
 except ImportError:
     from px4_qos import PX4_SENSOR_QOS
 
+try:
+    from .flight_residual_core import (
+        classify_flight_integrity,
+        infer_control_semantic_mode,
+        primary_residual_type_for_mode,
+    )
+except ImportError:
+    from flight_residual_core import (
+        classify_flight_integrity,
+        infer_control_semantic_mode,
+        primary_residual_type_for_mode,
+    )
+
 
 # ============================================================
 # Helpers
@@ -257,6 +270,11 @@ class FlightIntegrityNode(Node):
         self.declare_parameter("position_residual_warn_m", 1.50)
         self.declare_parameter("position_residual_error_m", 3.00)
 
+        # v0.1.1 mode-aware classification: in PX4 position mode,
+        # decreasing position error during climb/descent is treated as a
+        # tracking transient rather than a command-response failure.
+        self.declare_parameter("position_residual_trend_deadband_m", 0.05)
+
         self.declare_parameter("position_jump_min_m", 1.00)
         self.declare_parameter("position_jump_margin_m", 0.20)
         self.declare_parameter("position_jump_ratio", 5.0)
@@ -348,6 +366,9 @@ class FlightIntegrityNode(Node):
         self.position_residual_error_m = float(
             self.get_parameter("position_residual_error_m").value
         )
+        self.position_residual_trend_deadband_m = float(
+            self.get_parameter("position_residual_trend_deadband_m").value
+        )
         self.position_jump_min_m = float(self.get_parameter("position_jump_min_m").value)
         self.position_jump_margin_m = float(
             self.get_parameter("position_jump_margin_m").value
@@ -382,6 +403,10 @@ class FlightIntegrityNode(Node):
 
         self.last_estimator_status_msg: Optional[Any] = None
         self.last_estimator_status_receive_time: Optional[float] = None
+
+        # v0.1.1: track residual trend to avoid treating normal
+        # position-mode convergence as command-response failure.
+        self.prev_position_tracking_residual: Optional[float] = None
 
         self.setpoint_interval_ms = 0.0
         self.setpoint_jitter_ms = 0.0
@@ -696,6 +721,8 @@ class FlightIntegrityNode(Node):
         odom_age_sec = now - self.last_odom.receive_time
 
         offboard_active = any_offboard_axis_enabled(offboard)
+        control_semantic_mode = infer_control_semantic_mode(offboard)
+        primary_residual_type = primary_residual_type_for_mode(control_semantic_mode)
 
         sp_position = vec3_from(getattr(sp, "position", [math.nan, math.nan, math.nan]))
         sp_velocity = vec3_from(getattr(sp, "velocity", [math.nan, math.nan, math.nan]))
@@ -705,6 +732,7 @@ class FlightIntegrityNode(Node):
 
         velocity_tracking_residual = masked_diff_norm(sp_velocity, odom_velocity)
         position_tracking_residual = masked_diff_norm(sp_position, odom_position)
+        previous_position_tracking_residual = self.prev_position_tracking_residual
 
         gps_vio_jump_metric = self._gps_vio_jump_metric()
 
@@ -742,18 +770,42 @@ class FlightIntegrityNode(Node):
             gps_vio_jump_metric / max(self.position_jump_min_m, 1e-6),
         )
 
-        total_residual = (
-            velocity_residual_norm
-            + position_residual_norm
-            + jump_residual_norm
-            + jitter_residual
-            + max(setpoint_age_residual - 1.0, 0.0)
+        combined_tracking_residual = velocity_residual_norm + position_residual_norm
+
+        if primary_residual_type == "position":
+            mode_tracking_residual = position_residual_norm
+        elif primary_residual_type == "velocity":
+            mode_tracking_residual = velocity_residual_norm
+        elif primary_residual_type == "mixed":
+            mode_tracking_residual = combined_tracking_residual
+        else:
+            # Unsupported modes remain conservative but avoid overstating
+            # velocity-only intent when PX4 is not in velocity mode.
+            mode_tracking_residual = max(position_residual_norm, velocity_residual_norm)
+
+        stream_residual = (
+            max(setpoint_age_residual - 1.0, 0.0)
             + max(offboard_age_residual - 1.0, 0.0)
             + max(odom_age_residual - 1.0, 0.0)
         )
 
-        status, cause, candidate = self._classify_status_and_cause(
+        total_residual = (
+            combined_tracking_residual
+            + jump_residual_norm
+            + jitter_residual
+            + stream_residual
+        )
+
+        flight_residual = (
+            mode_tracking_residual
+            + jump_residual_norm
+            + jitter_residual
+            + stream_residual
+        )
+
+        classification = classify_flight_integrity(
             offboard_active=offboard_active,
+            control_semantic_mode=control_semantic_mode,
             velocity_tracking_residual=velocity_tracking_residual,
             position_tracking_residual=position_tracking_residual,
             gps_vio_jump_metric=gps_vio_jump_metric,
@@ -761,7 +813,27 @@ class FlightIntegrityNode(Node):
             offboard_age_ms=offboard_age_ms,
             odom_age_ms=odom_age_ms,
             setpoint_jitter_ms=self.setpoint_jitter_ms,
+            previous_position_tracking_residual=previous_position_tracking_residual,
+            position_trend_deadband_m=self.position_residual_trend_deadband_m,
+            setpoint_stale_warn_ms=self.setpoint_stale_warn_ms,
+            setpoint_stale_error_ms=self.setpoint_stale_error_ms,
+            offboard_stale_warn_ms=self.offboard_stale_warn_ms,
+            offboard_stale_error_ms=self.offboard_stale_error_ms,
+            odometry_stale_warn_ms=self.odometry_stale_warn_ms,
+            odometry_stale_error_ms=self.odometry_stale_error_ms,
+            setpoint_jitter_warn_ms=self.setpoint_jitter_warn_ms,
+            setpoint_jitter_error_ms=self.setpoint_jitter_error_ms,
+            velocity_residual_warn_mps=self.velocity_residual_warn_mps,
+            velocity_residual_error_mps=self.velocity_residual_error_mps,
+            position_residual_warn_m=self.position_residual_warn_m,
+            position_residual_error_m=self.position_residual_error_m,
         )
+
+        self.prev_position_tracking_residual = position_tracking_residual
+
+        status = classification.status
+        cause = classification.dominant_cause
+        candidate = classification.dominant_cause_candidate
 
         return self._base_payload(
             now=now,
@@ -769,6 +841,7 @@ class FlightIntegrityNode(Node):
             dominant_cause=cause,
             dominant_cause_candidate=candidate,
             total_residual=total_residual,
+            flight_residual=flight_residual,
             operator_attention=(status == "RESYNCING"),
             setpoint_age_sec=setpoint_age_sec,
             offboard_age_sec=offboard_age_sec,
@@ -783,6 +856,11 @@ class FlightIntegrityNode(Node):
             velocity_tracking_residual=velocity_tracking_residual,
             position_tracking_residual=position_tracking_residual,
             gps_vio_jump_metric=gps_vio_jump_metric,
+            control_semantic_mode=classification.control_semantic_mode,
+            primary_residual_type=classification.primary_residual_type,
+            position_residual_trend=classification.position_residual_trend,
+            position_residual_delta=classification.position_residual_delta,
+            tracking_transient=classification.tracking_transient,
         )
 
     def _gps_vio_jump_metric(self) -> float:
@@ -885,6 +963,7 @@ class FlightIntegrityNode(Node):
         odom_age_sec: float,
         missing_streams: str,
         stale_streams: str,
+        flight_residual: Optional[float] = None,
         dominant_cause_candidate: Optional[str] = None,
         offboard_active: bool = False,
         setpoint_velocity: Optional[List[float]] = None,
@@ -894,6 +973,11 @@ class FlightIntegrityNode(Node):
         velocity_tracking_residual: float = 0.0,
         position_tracking_residual: float = 0.0,
         gps_vio_jump_metric: float = 0.0,
+        control_semantic_mode: str = "UNKNOWN_MODE",
+        primary_residual_type: str = "unknown",
+        position_residual_trend: str = "unknown",
+        position_residual_delta: float = 0.0,
+        tracking_transient: bool = False,
     ) -> Dict[str, Any]:
         if dominant_cause_candidate is None:
             dominant_cause_candidate = dominant_cause
@@ -911,9 +995,14 @@ class FlightIntegrityNode(Node):
             "operatorAttentionRequired": bool(operator_attention or level == DIAG_ERROR),
 
             "totalResidual": finite_or(total_residual),
-            "flightResidual": finite_or(total_residual),
+            "flightResidual": finite_or(total_residual if flight_residual is None else flight_residual),
 
             "offboardActive": bool(offboard_active),
+            "controlSemanticMode": control_semantic_mode,
+            "primaryResidualType": primary_residual_type,
+            "positionResidualTrend": position_residual_trend,
+            "positionResidualDelta": finite_or(position_residual_delta),
+            "trackingTransient": bool(tracking_transient),
 
             "setpointAgeMs": finite_or(setpoint_age_sec * 1000.0, -1.0),
             "offboardModeAgeMs": finite_or(offboard_age_sec * 1000.0, -1.0),
