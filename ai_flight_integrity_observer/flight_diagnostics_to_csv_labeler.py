@@ -14,23 +14,23 @@ into a machine-readable CSV file for:
 - regression testing under companion-compute load
 - post-flight incident review
 
+v0.1.2+ gated schema notes:
+The labeler exposes mode-aware / gated-fuse fields as first-class CSV columns
+instead of hiding them only inside extraValuesJson:
+
+- controlSemanticMode
+- primaryResidualType
+- positionResidualTrend
+- positionResidualDelta
+- positionResidualStableCount
+- positionResidualStableCountThreshold
+- trackingTransient
+- criticalVelocityResidualMps
+
 Typical use:
 
     ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-args \
       -p output_csv:=flight_integrity_labels.csv
-
-With synthetic test:
-
-    Terminal 1:
-      ros2 run ai_flight_integrity_observer flight_integrity_node
-
-    Terminal 2:
-      ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-        -p profile:=command_response_mismatch
-
-    Terminal 3:
-      ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-args \
-        -p output_csv:=labels.csv
 """
 
 from __future__ import annotations
@@ -87,6 +87,13 @@ def kv_to_dict(values: Any) -> Dict[str, str]:
 def as_float(value: Optional[str], default: float = 0.0) -> float:
     try:
         return float(value)
+    except Exception:
+        return default
+
+
+def as_int(value: Optional[str], default: int = 0) -> int:
+    try:
+        return int(float(value))
     except Exception:
         return default
 
@@ -157,6 +164,16 @@ class FlightDiagnosticsToCsvLabeler(Node):
             "causalAlignment",
             "operatorAttentionRequired",
             "offboardActive",
+
+            # v0.1.2+ mode-aware / gated-fuse semantics
+            "controlSemanticMode",
+            "primaryResidualType",
+            "positionResidualTrend",
+            "positionResidualDelta",
+            "positionResidualStableCount",
+            "positionResidualStableCountThreshold",
+            "trackingTransient",
+            "criticalVelocityResidualMps",
 
             # Core residuals
             "totalResidual",
@@ -355,6 +372,20 @@ class FlightDiagnosticsToCsvLabeler(Node):
             "causalAlignment": kv.get("causalAlignment", ""),
             "operatorAttentionRequired": kv.get("operatorAttentionRequired", ""),
             "offboardActive": kv.get("offboardActive", ""),
+
+            # v0.1.2+ mode-aware / gated-fuse semantics
+            "controlSemanticMode": kv.get("controlSemanticMode", ""),
+            "primaryResidualType": kv.get("primaryResidualType", ""),
+            "positionResidualTrend": kv.get("positionResidualTrend", ""),
+            "positionResidualDelta": as_float(kv.get("positionResidualDelta")),
+            "positionResidualStableCount": as_int(kv.get("positionResidualStableCount")),
+            "positionResidualStableCountThreshold": as_int(
+                kv.get("positionResidualStableCountThreshold")
+            ),
+            "trackingTransient": kv.get("trackingTransient", ""),
+            "criticalVelocityResidualMps": as_float(
+                kv.get("criticalVelocityResidualMps")
+            ),
 
             # Core residuals
             "totalResidual": as_float(kv.get("totalResidual")),
