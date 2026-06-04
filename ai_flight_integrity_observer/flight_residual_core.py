@@ -4,14 +4,22 @@ flight_residual_core.py
 
 Mode-aware flight residual classification helpers for AI Flight Integrity Observer.
 
-This module keeps PX4 offboard-control semantics out of the ROS node plumbing:
-- POSITION_MODE: position setpoint is primary; velocity can be only feed-forward / auxiliary.
-- VELOCITY_MODE: velocity setpoint is primary.
-- MIXED_POSITION_VELOCITY_MODE: both position and velocity are meaningful.
+v0.1.2+ adds three safeguards over the initial mode-aware classifier:
 
-The goal of v0.1.1 is to avoid treating normal PX4 position-setpoint climb/descent
-as COMMAND_RESPONSE_MISMATCH merely because vehicle velocity is non-zero while the
-TrajectorySetpoint velocity vector is zero or unused.
+1. Anti-chattering for PX4 position tracking:
+   single-frame position residual deltas are noisy, so a large position residual
+   is treated as a tracking transient while it is still converging or while the
+   non-decreasing counter is below a configurable threshold.
+
+2. Mixed-mode feed-forward semantics:
+   in PX4 mixed position+velocity mode, position tracking is the primary
+   constraint and velocity is treated as feed-forward / auxiliary while the
+   position residual is still converging.
+
+3. Mixed-mode critical velocity fuse:
+   if the velocity residual exceeds a configurable physical ceiling in mixed
+   mode, it is treated as an execution collapse unless the position tracker is
+   still inside a legitimate dynamic capture transient.
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ class FlightIntegrityClassification:
     position_residual_trend: str
     position_residual_delta: float
     tracking_transient: bool
+    position_residual_stable_count: int
 
 
 def _bool_field(msg: Any, field: str) -> bool:
@@ -122,6 +131,25 @@ def position_residual_trend(
     return TREND_STABLE, delta
 
 
+def is_position_tracking_transient(
+    *,
+    trend: str,
+    position_residual_stable_count: int,
+    stable_count_threshold: int,
+) -> bool:
+    """
+    Decide whether a large position residual is still a permissible transient.
+
+    A single non-decreasing frame should not immediately turn a normal
+    PX4 position-mode climb/descent into RESYNCING. We tolerate a short
+    run of stable/increasing residuals before declaring a response mismatch.
+    """
+    if trend == TREND_DECREASING:
+        return True
+
+    return int(position_residual_stable_count) < int(max(stable_count_threshold, 1))
+
+
 def classify_flight_integrity(
     *,
     offboard_active: bool,
@@ -135,6 +163,8 @@ def classify_flight_integrity(
     setpoint_jitter_ms: float,
     previous_position_tracking_residual: Optional[float],
     position_trend_deadband_m: float,
+    position_residual_stable_count: int,
+    stable_count_threshold: int,
     setpoint_stale_warn_ms: float,
     setpoint_stale_error_ms: float,
     offboard_stale_warn_ms: float,
@@ -145,16 +175,20 @@ def classify_flight_integrity(
     setpoint_jitter_error_ms: float,
     velocity_residual_warn_mps: float,
     velocity_residual_error_mps: float,
+    critical_velocity_residual_mps: float,
     position_residual_warn_m: float,
     position_residual_error_m: float,
 ) -> FlightIntegrityClassification:
-    """Classify flight integrity with PX4 offboard-mode awareness."""
+    """Classify flight integrity with PX4 offboard-mode awareness and anti-chattering."""
     primary_residual_type = primary_residual_type_for_mode(control_semantic_mode)
     trend, delta = position_residual_trend(
         position_tracking_residual,
         previous_position_tracking_residual,
         deadband_m=position_trend_deadband_m,
     )
+
+    stable_count = int(max(position_residual_stable_count, 0))
+    stable_threshold = int(max(stable_count_threshold, 1))
 
     def result(status: str, cause: str, candidate: str, transient: bool = False):
         return FlightIntegrityClassification(
@@ -166,6 +200,7 @@ def classify_flight_integrity(
             position_residual_trend=trend,
             position_residual_delta=delta,
             tracking_transient=transient,
+            position_residual_stable_count=stable_count,
         )
 
     if not offboard_active:
@@ -183,11 +218,17 @@ def classify_flight_integrity(
     if gps_vio_jump_metric > 0.0:
         return result("RESYNCING", "GPS_VIO_JUMP", "GPS_VIO_JUMP")
 
+    position_transient = is_position_tracking_transient(
+        trend=trend,
+        position_residual_stable_count=stable_count,
+        stable_count_threshold=stable_threshold,
+    )
+
     # POSITION_MODE: velocity may be absent, zero, or used as feed-forward.
     # Do not let velocity residual alone trigger COMMAND_RESPONSE_MISMATCH.
     if control_semantic_mode == POSITION_MODE:
         if position_tracking_residual >= position_residual_error_m:
-            if trend == TREND_DECREASING:
+            if position_transient:
                 return result(
                     "DEGRADED",
                     "POSITION_TRACKING_TRANSIENT",
@@ -199,12 +240,19 @@ def classify_flight_integrity(
                 "POSITION_RESPONSE_MISMATCH",
                 "POSITION_RESPONSE_MISMATCH",
             )
+
         if position_tracking_residual >= position_residual_warn_m:
+            if position_transient:
+                return result(
+                    "DEGRADED",
+                    "POSITION_TRACKING_TRANSIENT",
+                    "POSITION_RESPONSE_MISMATCH",
+                    transient=True,
+                )
             return result(
                 "DEGRADED",
-                "POSITION_TRACKING_TRANSIENT" if trend == TREND_DECREASING else "POSITION_RESPONSE_MISMATCH",
                 "POSITION_RESPONSE_MISMATCH",
-                transient=(trend == TREND_DECREASING),
+                "POSITION_RESPONSE_MISMATCH",
             )
 
     # VELOCITY_MODE: velocity residual is the primary execution signal.
@@ -214,28 +262,76 @@ def classify_flight_integrity(
         if velocity_tracking_residual >= velocity_residual_warn_mps:
             return result("DEGRADED", "COMMAND_RESPONSE_MISMATCH", "COMMAND_RESPONSE_MISMATCH")
 
-    # MIXED mode: both position and velocity are semantically meaningful.
+    # MIXED mode: position is the main constraint; velocity is feed-forward
+    # while position is still converging. This avoids falsely punishing
+    # phase lag in the velocity feed-forward during normal trajectory capture.
     elif control_semantic_mode == MIXED_POSITION_VELOCITY_MODE:
-        if velocity_tracking_residual >= velocity_residual_error_mps:
-            return result("RESYNCING", "COMMAND_RESPONSE_MISMATCH", "COMMAND_RESPONSE_MISMATCH")
+        # Physical execution fuse with transient gating:
+        #
+        # In PX4 mixed position+velocity mode, velocity is commonly used as
+        # feed-forward while position remains the main constraint. A single
+        # aggressive AI/setpoint step can produce a large one-frame velocity
+        # residual even though the vehicle is still physically capturing the
+        # new position target. To avoid false red "critical" diagnostics during
+        # legitimate dynamic capture, the critical velocity fuse is blocked
+        # while position residual is still outside the warning band *and* the
+        # position tracker is still in a permissible transient window.
+        #
+        # Once position is inside the warning band, or once the position
+        # residual is no longer transient, an extreme velocity residual becomes
+        # a true critical command-response mismatch.
+        critical_velocity_threshold = max(float(critical_velocity_residual_mps), 0.0)
+        critical_velocity_exceeded = (
+            critical_velocity_threshold > 0.0
+            and velocity_tracking_residual >= critical_velocity_threshold
+        )
+        critical_velocity_blocked_by_transient = (
+            position_tracking_residual >= position_residual_warn_m
+            and position_transient
+        )
+
+        if critical_velocity_exceeded and not critical_velocity_blocked_by_transient:
+            return result(
+                "RESYNCING",
+                "CRITICAL_COMMAND_RESPONSE_MISMATCH",
+                "COMMAND_RESPONSE_MISMATCH",
+                transient=False,
+            )
+
         if position_tracking_residual >= position_residual_error_m:
-            if trend == TREND_DECREASING:
+            if position_transient:
                 return result(
                     "DEGRADED",
                     "POSITION_TRACKING_TRANSIENT",
                     "POSITION_RESPONSE_MISMATCH",
                     transient=True,
                 )
-            return result("RESYNCING", "POSITION_RESPONSE_MISMATCH", "POSITION_RESPONSE_MISMATCH")
-        if velocity_tracking_residual >= velocity_residual_warn_mps:
-            return result("DEGRADED", "COMMAND_RESPONSE_MISMATCH", "COMMAND_RESPONSE_MISMATCH")
+            return result(
+                "RESYNCING",
+                "POSITION_RESPONSE_MISMATCH",
+                "POSITION_RESPONSE_MISMATCH",
+            )
+
         if position_tracking_residual >= position_residual_warn_m:
+            if position_transient:
+                return result(
+                    "DEGRADED",
+                    "POSITION_TRACKING_TRANSIENT",
+                    "POSITION_RESPONSE_MISMATCH",
+                    transient=True,
+                )
             return result(
                 "DEGRADED",
-                "POSITION_TRACKING_TRANSIENT" if trend == TREND_DECREASING else "POSITION_RESPONSE_MISMATCH",
                 "POSITION_RESPONSE_MISMATCH",
-                transient=(trend == TREND_DECREASING),
+                "POSITION_RESPONSE_MISMATCH",
             )
+
+        # Only after position is within the warning band does velocity residual
+        # become a direct command-response mismatch signal in mixed mode.
+        if velocity_tracking_residual >= velocity_residual_error_mps:
+            return result("RESYNCING", "COMMAND_RESPONSE_MISMATCH", "COMMAND_RESPONSE_MISMATCH")
+        if velocity_tracking_residual >= velocity_residual_warn_mps:
+            return result("DEGRADED", "COMMAND_RESPONSE_MISMATCH", "COMMAND_RESPONSE_MISMATCH")
 
     # Unsupported / unknown modes: conservative but avoid claiming a velocity-only cause.
     else:
