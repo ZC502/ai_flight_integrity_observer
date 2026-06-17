@@ -1,285 +1,245 @@
-# AI Flight Integrity Observer
->**A ROS 2 / PX4 runtime observer for flight execution integrity under AI and companion-compute load.**
+# AI Flight Integrity Observer (AFIO)
 
-**Quantify whether AI-generated offboard control intent is physically realized in vehicle response.**
+> **A zero-intrusive ROS 2 / PX4 runtime assurance observer for Offboard autonomy under degraded AI compute and communication conditions.**
+>
+> AFIO turns PX4 Offboard boundary degradation into standard ROS diagnostics and machine-readable CSV labels.
 
-Modern drones increasingly rely on companion computers for:
+[![ROS 2](https://img.shields.io/badge/ROS%202-Humble%20%7C%20Jazzy-blue)](https://docs.ros.org/en/humble/index.html)
+[![PX4 Autopilot](https://img.shields.io/badge/PX4-v1.14%20%7C%20v1.15-orange)](https://px4.io/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
 
-```text
-VIO
-target tracking
-obstacle avoidance
-edge AI perception
-semantic navigation
-AI-assisted offboard autonomy
-```
-
-But heavy AI workloads can silently degrade the offboard control boundary:
+AFIO observes the runtime boundary between a companion computer and PX4:
 
 ```text
-setpoint publish jitter
-stale trajectory commands
-delayed vehicle odometry
-estimator lag
-GPS / VIO jumps
-command-response desynchronization
-```
-
-This project does **not** intercept flight control.
-
-It observes whether offboard setpoints are physically realized by the vehicle, and exposes flight execution collapse through standard ROS 2 diagnostics.
-
-GPS /Initial target:
-```text
-/fmu/in/offboard_control_mode
-/fmu/in/trajectory_setpoint
-/fmu/out/vehicle_odometry
+AI / VIO / visual tracking / neural planner
         ↓
+/fmu/in/trajectory_setpoint
+/fmu/in/offboard_control_mode
+        ↓
+PX4 Offboard control boundary
+        ↓
+/fmu/out/vehicle_odometry
+```
+
+It does **not** modify PX4, intercept flight control, publish emergency commands, or replace failsafe logic. It only asks one question:
+
+```text
+Is the vehicle still physically and temporally realizing the Offboard intent stream?
+```
+
+AFIO publishes the answer through:
+
+```text
 /diagnostics
   ai_flight_integrity/flight_execution_integrity
+
+CSV labels
+  setpointAgeMs
+  setpointJitterMs
+  flightResidual
+  dominantCause
+  causalAlignment
+  diagnosticLevelName
 ```
 
 ---
 
-## Current Status
+## Empirical Result: Controlled AI-Lag Injection
 
-`ai_flight_integrity_observer` is currently at **v0.1-alpha**.
+AFIO was evaluated in a Gazebo / PX4 SITL closed-loop tracking mission using a separate `ai_latency_injector_node`.
 
-The first version provides:
+The injector is independent from the observer. AFIO does **not** read `ai_lag_ms`, injector state, or any private test parameter. It only observes the PX4-facing boundary topics and infers degradation from timing freshness and execution residuals.
+
+| Injected AI lag | Diagnostic outcome | Dominant cause | `setpointJitterMs` p95 | `setpointAgeMs` p95 | `flightResidual` p95 |
+|---:|---:|---|---:|---:|---:|
+| 0 ms | 100% OK | 100% `NONE` | 50.9 ms | 57.1 ms | 0.214 |
+| 30 ms | 100% OK | 100% `NONE` | 57.2 ms | 31.0 ms | 0.237 |
+| 80 ms | 100% OK | 100% `NONE` | 64.4 ms | 85.6 ms | 0.264 |
+| 150 ms | 100% WARN | 96.9% `SETPOINT_JITTER` | 119.0 ms | 143.8 ms | 0.483 |
+| 300 ms | 73.4% WARN / 26.6% ERROR | 51.5% `SETPOINT_JITTER` / 48.5% `STALE_STREAM` | 277.2 ms | 280.9 ms | 1.107 |
+
+Interpretation:
 
 ```text
-observe-only flight integrity diagnostics
-PX4-style synthetic publisher for smoke testing
-standard ROS /diagnostics output
-Best Effort / Volatile QoS for PX4-facing topics
-load-metadata placeholders for future AI stress testing
+0–80 ms:
+  The system remains aligned. AFIO stays quiet.
+
+150 ms:
+  The Offboard boundary enters a measurable degraded state.
+  AFIO emits SETPOINT_JITTER before a hard flight failure.
+
+300 ms:
+  The Offboard stream crosses a freshness boundary.
+  AFIO reports STALE_STREAM / RESYNCING through standard ROS diagnostics.
 ```
 
-It currently detects or exposes:
+Real UAV hardware stacks vary widely: ELRS / 4G / 5G / WiFi / custom telemetry links, Jetson Nano / NX / Orin, RK3588, NPU boards, different DDS configurations, different PX4 versions, and different Offboard planners. A single real-drone benchmark is valuable, but it is not broadly generalizable by itself.​
+
+For this reason, AFIO includes a decoupled `ai_latency_injector_node` that enables controlled-variable testing at the PX4 Offboard setpoint boundary. The injector is independent from the observer. AFIO does not read `ai_lag_ms`, injector state, or any private test parameter. It only observes the PX4-facing boundary topics and infers degradation from setpoint freshness, stream jitter, Offboard mode, and vehicle response residuals.​
+
+Real YOLO / VIO / tracking / VLA workloads can later be substituted as the upstream source of delay. The controlled injector simply provides a reproducible way for developers to evaluate their own platform-specific timing margins.
+
+---
+
+## Why This Exists: Two Reliability Surfaces
+
+### A. Degraded Communication / RF / Telemetry Link Volatility
+
+In degraded or contested communication environments, the Offboard stream may not simply disappear. It may become bursty, stale, or highly jittered while still producing syntactically valid messages.
+
+AFIO exposes this early through:
+
+```text
+setpointAgeMs
+setpointJitterMs
+staleStreams
+causalAlignment
+```
+
+External autonomy managers can use these signals to trigger runtime-assurance responses such as:
+
+```text
+slow down aggressive maneuvers
+enter Hold / Loiter / Cruise mode
+prioritize control telemetry over high-bandwidth video
+switch to a backup control link
+increase link robustness before hard stream loss
+```
+
+AFIO does not implement these recovery actions itself. It provides the observable boundary signal.
+
+### B. Edge-AI / Vision Stack Overload
+
+VIO, visual tracking, object detection, neural planning, mapping, and semantic navigation can create bursty companion-compute load. When perception inference latency spikes, the Offboard setpoint publisher may become delayed or irregular even while PX4 itself remains healthy.
+
+AFIO turns that hidden compute-side degradation into visible diagnostics:
 
 ```text
 SETPOINT_JITTER
 SETPOINT_STALE
-OFFBOARD_STALE
-ODOMETRY_STALE
+STALE_STREAM
 COMMAND_RESPONSE_MISMATCH
 POSITION_RESPONSE_MISMATCH
-GPS_VIO_JUMP
-MISSING_STREAM
+```
+
+A companion-compute orchestrator can subscribe to `/diagnostics` and perform load-shedding:
+
+```text
+skip frames
+reduce perception resolution
+pause non-critical loop closure
+switch from a heavy model to a lightweight fallback
+reserve CPU affinity / scheduling priority for control publishing
 ```
 
 ---
 
-## What It Is Not
+## Architecture: Blind Boundary Observation
 
-This project is not a flight controller.
+```text
++-------------------------------------------------------------+
+|                     Companion Computer                      |
+|                                                             |
+|   VIO / tracking / neural planner / edge-AI perception      |
+|                         │                                   |
+|                         ▼                                   |
+|              /ai/raw_trajectory_setpoint                    |
+|                         │                                   |
+|              [ ai_latency_injector_node ]                   |
+|                         │                                   |
++-------------------------+-----------------------------------+
+                          │
+                          ▼
+              /fmu/in/trajectory_setpoint
+              /fmu/in/offboard_control_mode
+                          │
++-------------------------+-----------------------------------+
+|                    PX4 / ROS 2 Boundary                     |
+|                                                             |
+|        [ AFIO: flight_integrity_node ]                      |
+|                                                             |
+|        Observes:                                            |
+|          /fmu/in/trajectory_setpoint                        |
+|          /fmu/in/offboard_control_mode                      |
+|          /fmu/out/vehicle_odometry                          |
+|                                                             |
+|        Publishes:                                           |
+|          /diagnostics                                       |
+|          CSV labels                                         |
++-------------------------+-----------------------------------+
+                          │
+                          ▼
++-------------------------------------------------------------+
+|                         PX4 Autopilot                       |
+|                 SITL or hardware flight core                |
++-------------------------------------------------------------+
+```
+
+The injector is only a test tool. The observer is blind to it. In a real deployment, the same observed degradation may come from AI inference stalls, overloaded companion compute, middleware jitter, telemetry loss, or estimator/odometry delays.
+
+---
+
+## NARH-Lite: Residual Auditing Principle
+
+AFIO is inspired by the **Non-Associative Residual Hypothesis (NARH)**, originally formulated for discrete rigid-body simulation pipelines.
+
+In the original NARH framing, a discrete solver may apply constraint or correction operators in different internal orders because of batching, projection, thread scheduling, or finite-precision effects. The resulting **Non-Associative Residual (NAR)** measures order-dependent deviation introduced by the numerical pipeline. It is not a claim that the physical state space itself is non-associative.
+
+AFIO does not claim to inspect PX4's internal solver order. Instead, it applies the same residual-auditing idea at the ROS 2 / PX4 Offboard boundary:
+
+```text
+intent stream      = trajectory setpoint
+feedback stream    = vehicle odometry
+freshness stream   = message age, jitter, missing/stale status
+semantic mode      = position / velocity / mixed Offboard mode
+```
+
+AFIO computes a boundary residual bundle:
+
+```text
+R_boundary = w_t R_timing
+           + w_p R_position
+           + w_v R_velocity
+           + w_s R_stream
+```
+
+where:
+
+```text
+R_timing   → setpoint age / jitter / stale stream residual
+R_position → position-tracking residual under position-mode semantics
+R_velocity → velocity-tracking residual under velocity-mode semantics
+R_stream   → missing or stale Offboard / odometry streams
+```
+
+The goal is not to prove that PX4 or ROS 2 is mathematically invalid. The goal is practical runtime assurance:
+
+```text
+Detect when a previously aligned Offboard boundary begins to exhibit structured residual growth.
+```
+
+---
+
+## What AFIO Is Not
+
+AFIO is not a flight controller and does not guarantee flight safety.
 
 It does not:
 
 ```text
-publish flight commands
 arm or disarm the vehicle
+publish recovery setpoints
 replace PX4 failsafe logic
 modify PX4
-modify offboard control code
-guarantee flight safety
+modify the Offboard controller
+claim real AI workload equivalence from synthetic latency alone
 ```
 
-It is a passive runtime observer.
-
----
-
-### Repository Layout
-
-Expected package layout:
-```
-ai_flight_integrity_observer/
-├── README.md
-├── package.xml
-├── setup.py
-├── setup.cfg
-├── resource/
-│   └── ai_flight_integrity_observer
-├── launch/
-│   └── flight_integrity_observer.launch.py        # optional
-└── ai_flight_integrity_observer/
-    ├── __init__.py
-    ├── px4_qos.py
-    ├── flight_integrity_node.py
-    ├── synthetic_px4_publisher.py
-    └── flight_diagnostics_to_csv_labeler.py
-```
-Before building, make sure these files exist:
-```
-setup.cfg
-resource/ai_flight_integrity_observer
-ai_flight_integrity_observer/__init__.py
-```
-`setup.cfg` is required for ROS 2 `ament_python` console scripts. Without it, the package may build successfully, but `ros2 run` may report:
-```
-No executable found
-```
+It is a passive observer and label generator for runtime assurance, regression testing, and post-flight analysis.
 
 ---
 
-## Quick Start A: Synthetic Smoke Test
-
-This test does **not** require PX4 SITL, Gazebo, Micro XRCE-DDS Agent, or a real UAV.
-
-It verifies that the observer, PX4-style messages, QoS, diagnostics, fault profiles, and CSV label export are wired correctly.
-
-**1. Create a ROS 2 workspace**
-```
-mkdir -p ~/px4_ros2_ws/src
-cd ~/px4_ros2_ws/src
-```
-**2. Clone dependencies and this repository**
-```
-git clone https://github.com/PX4/px4_msgs.git
-git clone https://github.com/ZC502/ai_flight_integrity_observer.git
-```
-Make sure the `px4_msgs` branch matches the PX4 firmware / SITL version you plan to use later.
-
-**3. Build**
-```
-cd ~/px4_ros2_ws
-
-source /opt/ros/humble/setup.bash
-
-colcon build --symlink-install --merge-install
-
-source install/setup.bash
-```
-Verify that the package and executables are visible:
-```bash
-ros2 pkg list | grep ai_flight_integrity_observer
-ros2 pkg executables ai_flight_integrity_observer
-```
-Expected executables:
-```
-ai_flight_integrity_observer flight_integrity_node
-ai_flight_integrity_observer synthetic_px4_publisher
-ai_flight_integrity_observer flight_diagnostics_to_csv_labeler
-```
-**4. Terminal 1: Start the observer**
-```Bash
-source /opt/ros/humble/setup.bash
-source ~/px4_ros2_ws/install/setup.bash
-ros2 run ai_flight_integrity_observer flight_integrity_node
-```
-Expected startup log:
-```Plaintext
-AI Flight Integrity Observer started | setpoint=/fmu/in/trajectory_setpoint | offboard_mode=/fmu/in/offboard_control_mode | odometry=/fmu/out/vehicle_odometry | diagnostics=/diagnostics
-```
-**5. Terminal 2: Start the synthetic PX4 publisher**
-
-Normal mode:
-```Bash
-source /opt/ros/humble/setup.bash
-source ~/px4_ros2_ws/install/setup.bash
-ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=normal
-```
-Fault modes:
-```
-ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=setpoint_jitter \
-  -p fault_duration_sec:=9999.0
-ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=command_response_mismatch \
-  -p fault_duration_sec:=9999.0
-ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
-  -p profile:=gps_vio_jump \
-  -p fault_duration_sec:=9999.0
-```
-Why `fault_duration_sec:=9999.0`?
-
-Short fault windows can end before you inspect `/diagnostics`. A long fault duration makes the failure state easier to observe in the terminal or dashboard.
-
-**6. Terminal 3: Inspect diagnostics**
-```Bash
-source /opt/ros/humble/setup.bash
-source ~/px4_ros2_ws/install/setup.bash
-ros2 topic echo /diagnostics --once --full-length
-```
-A more compact diagnostic view:
-```Bash
-ros2 topic echo /diagnostics --once --full-length \
-| awk '
-/message:/ {print}
-/- key: diagnosticLevelName$/ ||
-/- key: status$/ ||
-/- key: dominantCause$/ ||
-/- key: totalResidual$/ ||
-/- key: flightResidual$/ ||
-/- key: setpointJitterMs$/ ||
-/- key: velocityTrackingResidual$/ ||
-/- key: positionTrackingResidual$/ ||
-/- key: gpsVioJumpMetric$/ ||
-/- key: staleStreams$/ ||
-/- key: statsEvaluations$/ {
-  print
-  getline
-  print
-}'
-```
-Expected results:
-```
-normal                    → OK    | GREEN: FLIGHT_ALIGNED
-setpoint_jitter           → ERROR | RESYNCING: SETPOINT_JITTER
-command_response_mismatch → ERROR | RESYNCING: COMMAND_RESPONSE_MISMATCH or POSITION_RESPONSE_MISMATCH
-gps_vio_jump              → ERROR | RESYNCING: GPS_VIO_JUMP
-```
-Note on `command_response_mismatch`:
-
-During the active fault window, the vehicle velocity intentionally fails to track the setpoint, so the observer may report:
-```
-COMMAND_RESPONSE_MISMATCH
-```
-After the velocity recovers, the vehicle may still lag behind the setpoint position. In that case, the observer correctly reports:
-```
-POSITION_RESPONSE_MISMATCH
-```
-This means the observer is detecting the remaining physical execution error, not that the test failed.
-
----
-
-### CSV Failure Label Export
-
-The observer publishes flight execution-integrity events to `/diagnostics`.
-
-For ML / Sim2Real / AI-load regression workflows, the included CSV labeler converts those diagnostics into machine-readable failure labels.
-
-**Terminal 4: Start the CSV labeler**
-```Bash
-source /opt/ros/humble/setup.bash
-source ~/px4_ros2_ws/install/setup.bash
-ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-args \
-  -p output_csv:=flight_integrity_labels.csv
-```
-Inspect the CSV:
-```Bash
-head -n 5 flight_integrity_labels.csv
-tail -f flight_integrity_labels.csv
-```
-Example labels:
-```
-ros_time_sec,diagnostic_level_name,status,dominantCause,totalResidual,flightResidual,velocityTrackingResidual,gpsVioJumpMetric,setpointJitterMs
-1779800001.12,ERROR,RESYNCING,COMMAND_RESPONSE_MISMATCH,1.428000,1.428000,0.900000,0.000000,0.00
-1779800004.54,ERROR,RESYNCING,GPS_VIO_JUMP,3.210000,3.210000,0.000000,2.100000,0.00
-```
-These labels can be used for:
-- AI-load regression testing
-- Sim2Real failure mining
-- offboard setpoint failure datasets
-- OOD event detection
-- post-flight incident review
-
----
-
-### Quick Start B: PX4 SITL Path
-
-The synthetic test is only the first smoke test.
+### Quick Start A: PX4 SITL Path
 
 For real PX4 validation, you need:
 ```
@@ -472,29 +432,155 @@ values:
 
 ---
 
-## Why This Exists
+## Quick Start B: Synthetic Smoke Test
 
-As UAVs integrate heavier companion-compute workloads for VIO, tracking, obstacle avoidance, and edge AI perception, the offboard control boundary becomes a critical failure surface.
+This test does **not** require PX4 SITL, Gazebo, Micro XRCE-DDS Agent, or a real UAV.
 
-The important question is not only:
+It verifies that the observer, PX4-style messages, QoS, diagnostics, fault profiles, and CSV label export are wired correctly.
 
-```text
-Is the AI model running?
+**1. Create a ROS 2 workspace**
 ```
-
-but also:
-
-```text
-Is the vehicle physically realizing the setpoints produced under that AI load?
+mkdir -p ~/px4_ros2_ws/src
+cd ~/px4_ros2_ws/src
 ```
+**2. Clone dependencies and this repository**
+```
+git clone https://github.com/PX4/px4_msgs.git
+git clone https://github.com/ZC502/ai_flight_integrity_observer.git
+```
+Make sure the `px4_msgs` branch matches the PX4 firmware / SITL version you plan to use later.
 
-`AI Flight Integrity Observer` is designed to make that boundary visible.
+**3. Build**
+```
+cd ~/px4_ros2_ws
+
+source /opt/ros/humble/setup.bash
+
+colcon build --symlink-install --merge-install
+
+source install/setup.bash
+```
+Verify that the package and executables are visible:
+```bash
+ros2 pkg list | grep ai_flight_integrity_observer
+ros2 pkg executables ai_flight_integrity_observer
+```
+Expected executables:
+```
+ai_flight_integrity_observer flight_integrity_node
+ai_flight_integrity_observer synthetic_px4_publisher
+ai_flight_integrity_observer flight_diagnostics_to_csv_labeler
+```
+**4. Terminal 1: Start the observer**
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
+ros2 run ai_flight_integrity_observer flight_integrity_node
+```
+Expected startup log:
+```Plaintext
+AI Flight Integrity Observer started | setpoint=/fmu/in/trajectory_setpoint | offboard_mode=/fmu/in/offboard_control_mode | odometry=/fmu/out/vehicle_odometry | diagnostics=/diagnostics
+```
+**5. Terminal 2: Start the synthetic PX4 publisher**
+
+Normal mode:
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
+ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
+  -p profile:=normal
+```
+Fault modes:
+```
+ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
+  -p profile:=setpoint_jitter \
+  -p fault_duration_sec:=9999.0
+ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
+  -p profile:=command_response_mismatch \
+  -p fault_duration_sec:=9999.0
+ros2 run ai_flight_integrity_observer synthetic_px4_publisher --ros-args \
+  -p profile:=gps_vio_jump \
+  -p fault_duration_sec:=9999.0
+```
+Why `fault_duration_sec:=9999.0`?
+
+Short fault windows can end before you inspect `/diagnostics`. A long fault duration makes the failure state easier to observe in the terminal or dashboard.
+
+**6. Terminal 3: Inspect diagnostics**
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
+ros2 topic echo /diagnostics --once --full-length
+```
+A more compact diagnostic view:
+```Bash
+ros2 topic echo /diagnostics --once --full-length \
+| awk '
+/message:/ {print}
+/- key: diagnosticLevelName$/ ||
+/- key: status$/ ||
+/- key: dominantCause$/ ||
+/- key: totalResidual$/ ||
+/- key: flightResidual$/ ||
+/- key: setpointJitterMs$/ ||
+/- key: velocityTrackingResidual$/ ||
+/- key: positionTrackingResidual$/ ||
+/- key: gpsVioJumpMetric$/ ||
+/- key: staleStreams$/ ||
+/- key: statsEvaluations$/ {
+  print
+  getline
+  print
+}'
+```
+Expected results:
+```
+normal                    → OK    | GREEN: FLIGHT_ALIGNED
+setpoint_jitter           → ERROR | RESYNCING: SETPOINT_JITTER
+command_response_mismatch → ERROR | RESYNCING: COMMAND_RESPONSE_MISMATCH or POSITION_RESPONSE_MISMATCH
+gps_vio_jump              → ERROR | RESYNCING: GPS_VIO_JUMP
+```
+Note on `command_response_mismatch`:
+
+During the active fault window, the vehicle velocity intentionally fails to track the setpoint, so the observer may report:
+```
+COMMAND_RESPONSE_MISMATCH
+```
+After the velocity recovers, the vehicle may still lag behind the setpoint position. In that case, the observer correctly reports:
+```
+POSITION_RESPONSE_MISMATCH
+```
+This means the observer is detecting the remaining physical execution error, not that the test failed.
 
 ---
 
-## License
+### CSV Failure Label Export
 
-Apache-2.0
+The observer publishes flight execution-integrity events to `/diagnostics`.
 
+For ML / Sim2Real / AI-load regression workflows, the included CSV labeler converts those diagnostics into machine-readable failure labels.
+
+**Terminal 4: Start the CSV labeler**
+```Bash
+source /opt/ros/humble/setup.bash
+source ~/px4_ros2_ws/install/setup.bash
+ros2 run ai_flight_integrity_observer flight_diagnostics_to_csv_labeler --ros-args \
+  -p output_csv:=flight_integrity_labels.csv
 ```
+Inspect the CSV:
+```Bash
+head -n 5 flight_integrity_labels.csv
+tail -f flight_integrity_labels.csv
 ```
+Example labels:
+```
+ros_time_sec,diagnostic_level_name,status,dominantCause,totalResidual,flightResidual,velocityTrackingResidual,gpsVioJumpMetric,setpointJitterMs
+1779800001.12,ERROR,RESYNCING,COMMAND_RESPONSE_MISMATCH,1.428000,1.428000,0.900000,0.000000,0.00
+1779800004.54,ERROR,RESYNCING,GPS_VIO_JUMP,3.210000,3.210000,0.000000,2.100000,0.00
+```
+These labels can be used for:
+- AI-load regression testing
+- Sim2Real failure mining
+- offboard setpoint failure datasets
+- OOD event detection
+- post-flight incident review
