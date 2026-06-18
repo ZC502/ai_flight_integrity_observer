@@ -4,6 +4,8 @@
 >
 > AFIO turns PX4 Offboard boundary degradation into standard ROS diagnostics and machine-readable CSV labels.
 
+*AFIO is not an AI model and does not use machine learning for detection. It is a deterministic residual-based runtime assurance observer for UAV systems that may be running AI-heavy companion-compute workloads upstream.*
+
 [![ROS 2](https://img.shields.io/badge/ROS%202-Humble%20%7C%20Jazzy-blue)](https://docs.ros.org/en/humble/index.html)
 [![PX4 Autopilot](https://img.shields.io/badge/PX4-v1.14%20%7C%20v1.15-orange)](https://px4.io/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
