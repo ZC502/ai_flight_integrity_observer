@@ -25,6 +25,8 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "fake_slam_stressor_node = ai_flight_integrity_observer.fake_slam_stressor_node:main",
+            "obio_gated_load_shedder = ai_flight_integrity_observer.obio_gated_load_shedder:main",
             "ai_latency_injector_node = ai_flight_integrity_observer.ai_latency_injector_node:main",
             "flight_integrity_node = ai_flight_integrity_observer.flight_integrity_node:main",
             "synthetic_px4_publisher = ai_flight_integrity_observer.synthetic_px4_publisher:main",
