@@ -62,7 +62,7 @@ If `flightResidual` **spikes (Physical tracking divergence imminent)**:
 
 In degraded or contested communication environments, the Offboard stream may not simply disappear. It may become bursty, stale, or highly jittered while still producing syntactically valid messages.
 
-AFIO exposes this early through:
+OBIO exposes this early through:
 
 ```text
 setpointAgeMs
@@ -81,13 +81,13 @@ switch to a backup control link
 increase link robustness before hard stream loss
 ```
 
-AFIO does not implement these recovery actions itself. It provides the observable boundary signal.
+OBIO does not implement these recovery actions itself. It provides the observable boundary signal.
 
 ### B. Edge-AI / Vision Stack Overload
 
 VIO, visual tracking, object detection, neural planning, mapping, and semantic navigation can create bursty companion-compute load. When perception inference latency spikes, the Offboard setpoint publisher may become delayed or irregular even while PX4 itself remains healthy.
 
-AFIO turns that hidden compute-side degradation into visible diagnostics:
+OBIO turns that hidden compute-side degradation into visible diagnostics:
 
 ```text
 SETPOINT_JITTER
@@ -131,7 +131,7 @@ reserve CPU affinity / scheduling priority for control publishing
 +-------------------------+-----------------------------------+
 |                    PX4 / ROS 2 Boundary                     |
 |                                                             |
-|        [ AFIO: flight_integrity_node ]                      |
+|        [ OBIO: flight_integrity_node ]                      |
 |                                                             |
 |        Observes:                                            |
 |          /fmu/in/trajectory_setpoint                        |
@@ -156,11 +156,11 @@ The injector is only a test tool. The observer is blind to it. In a real deploym
 
 ## NARH-Lite: Residual Auditing Principle
 
-AFIO is inspired by the **Non-Associative Residual Hypothesis (NARH)**, originally formulated for discrete rigid-body simulation pipelines.
+OBIO is inspired by the **Non-Associative Residual Hypothesis (NARH)**, originally formulated for discrete rigid-body simulation pipelines.
 
 In the original NARH framing, a discrete solver may apply constraint or correction operators in different internal orders because of batching, projection, thread scheduling, or finite-precision effects. The resulting **Non-Associative Residual (NAR)** measures order-dependent deviation introduced by the numerical pipeline. It is not a claim that the physical state space itself is non-associative.
 
-AFIO does not claim to inspect PX4's internal solver order. Instead, it applies the same residual-auditing idea at the ROS 2 / PX4 Offboard boundary:
+OBIO does not claim to inspect PX4's internal solver order. Instead, it applies the same residual-auditing idea at the ROS 2 / PX4 Offboard boundary:
 
 ```text
 intent stream      = trajectory setpoint
@@ -169,7 +169,7 @@ freshness stream   = message age, jitter, missing/stale status
 semantic mode      = position / velocity / mixed Offboard mode
 ```
 
-AFIO computes a boundary residual bundle:
+OBIO computes a boundary residual bundle:
 
 ```text
 R_boundary = w_t R_timing
