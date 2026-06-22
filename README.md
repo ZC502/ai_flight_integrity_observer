@@ -1,85 +1,58 @@
-# AI Flight Integrity Observer (AFIO)
+# Offboard Boundary Integrity Observer (OBIO)
+*Formerly AFIO — Autonomy Flight Integrity Observer*
+> **A deterministic ROS 2 / PX4 runtime assurance observer for compute-heavy Offboard autonomy stacks.**
 
-> **A zero-intrusive ROS 2 / PX4 runtime assurance observer for Offboard autonomy under degraded AI compute and communication conditions.**
->
-> AFIO turns PX4 Offboard boundary degradation into standard ROS diagnostics and machine-readable CSV labels.
-
-*AFIO is not an AI model and does not use machine learning for detection. It is a deterministic residual-based runtime assurance observer for UAV systems that may be running AI-heavy companion-compute workloads upstream.*
 
 [![ROS 2](https://img.shields.io/badge/ROS%202-Humble%20%7C%20Jazzy-blue)](https://docs.ros.org/en/humble/index.html)
 [![PX4 Autopilot](https://img.shields.io/badge/PX4-v1.14%20%7C%20v1.15-orange)](https://px4.io/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
 
-AFIO observes the runtime boundary between a companion computer and PX4:
+### The Missing Trigger for Autonomy Load-Shedding
 
-```text
-AI / VIO / visual tracking / neural planner
-        ↓
-/fmu/in/trajectory_setpoint
-/fmu/in/offboard_control_mode
-        ↓
-PX4 Offboard control boundary
-        ↓
-/fmu/out/vehicle_odometry
-```
+Modern UAV autonomy stacks increasingly run VIO, LVI, SLAM, mapping, visual tracking, neural planning, and dense perception workloads on edge hardware (Jetson, RK3588, NPU, custom companion computers).
 
-It does **not** modify PX4, intercept flight control, publish emergency commands, or replace failsafe logic. It only asks one question:
+When pushing these systems to their limits, autonomy managers need to know when to dynamically shed load (e.g., lower camera resolution, pause loop closure, switch to a lighter fallback model).
 
-```text
-Is the vehicle still physically and temporally realizing the Offboard intent stream?
-```
+Currently, most adaptive compute policies use indirect hardware signals: `CPU %`, `GPU %`, `memory usage`, or `temperature`.
 
-AFIO publishes the answer through:
+These signals are useful, but they do not answer the ultimate flight-control question. Using `CPU %` as the sole trigger for load-shedding is often lagging and fundamentally flawed:
 
-```text
-/diagnostics
-  ai_flight_integrity/flight_execution_integrity
+- A well-optimized pipeline can run at **99% CPU** while the Offboard control stream remains perfectly healthy and on time.
+- Conversely, a system might show only **60% CPU** load, but due to thread starvation, mutex lock contention, sensor synchronization bottlenecks, or bus stalls, the control publisher is blocked, delaying the Offboard setpoint by a lethal 150–300 ms.
 
-CSV labels
-  setpointAgeMs
-  setpointJitterMs
-  flightResidual
-  dominantCause
-  causalAlignment
-  diagnosticLevelName
-```
+**OBIO provides the missing semantic trigger**. Instead of asking "*Is the companion computer busy?*", OBIO asks: "*Has the companion workload begun to pollute the real-time flight control boundary?*"
 
----
+### Low-Overhead Boundary Health Signals
 
-## Empirical Result: Controlled AI-Lag Injection
+OBIO does not perform scheduling, model pruning, perception, mapping, or flight control by itself. It is a low-overhead, zero-intrusive boundary observer.
 
-AFIO was evaluated in a Gazebo / PX4 SITL closed-loop tracking mission using a separate `ai_latency_injector_node`.
+It passively watches the ROS 2 / PX4 boundary:
 
-The injector is independent from the observer. AFIO does **not** read `ai_lag_ms`, injector state, or any private test parameter. It only observes the PX4-facing boundary topics and infers degradation from timing freshness and execution residuals.
+- `/fmu/in/trajectory_setpoint`
+- `/fmu/in/offboard_control_mode`
+- `/fmu/out/vehicle_odometry`
 
-| Injected AI lag | Diagnostic outcome | Dominant cause | `setpointJitterMs` p95 | `setpointAgeMs` p95 | `flightResidual` p95 |
-|---:|---:|---|---:|---:|---:|
-| 0 ms | 100% OK | 100% `NONE` | 50.9 ms | 57.1 ms | 0.214 |
-| 30 ms | 100% OK | 100% `NONE` | 57.2 ms | 31.0 ms | 0.237 |
-| 80 ms | 100% OK | 100% `NONE` | 64.4 ms | 85.6 ms | 0.264 |
-| 150 ms | 100% WARN | 96.9% `SETPOINT_JITTER` | 119.0 ms | 143.8 ms | 0.483 |
-| 300 ms | 73.4% WARN / 26.6% ERROR | 51.5% `SETPOINT_JITTER` / 48.5% `STALE_STREAM` | 277.2 ms | 280.9 ms | 1.107 |
+It publishes standard `/diagnostics` and CSV labels that your existing lifecycle scripts or autonomy managers can consume:
+- `setpointAgeMs`
+- `setpointJitterMs`
+- `staleStreams`
+- `flightResidual` (NARH-inspired physical-temporal consistency score)
+- `dominantCause`
 
-Interpretation:
+### Use Case: LVI / VIO / SLAM Dynamic Load-Shedding
 
-```text
-0–80 ms:
-  The system remains aligned. AFIO stays quiet.
+OBIO does not optimize LVI algorithms internally. It tells your autonomy manager exactly when the LVI load is violating the flight-control timing margins.
 
-150 ms:
-  The Offboard boundary enters a measurable degraded state.
-  AFIO emits SETPOINT_JITTER before a hard flight failure.
+If `setpointJitterMs` **rises above threshold (Control-path pressure detected)**:
+- Reduce visual tracking framerate or input resolution.
+- Pause global SLAM loop closure.
+- Restrict non-linear optimization iterations (e.g., in IESKF).
+- Protect the RTOS scheduling priority of the control-intent publisher thread.
 
-300 ms:
-  The Offboard stream crosses a freshness boundary.
-  AFIO reports STALE_STREAM / RESYNCING through standard ROS diagnostics.
-```
-
-Real UAV hardware stacks vary widely: ELRS / 4G / 5G / WiFi / custom telemetry links, Jetson Nano / NX / Orin, RK3588, NPU boards, different DDS configurations, different PX4 versions, and different Offboard planners. A single real-drone benchmark is valuable, but it is not broadly generalizable by itself.​
-
-For this reason, AFIO includes a decoupled `ai_latency_injector_node` that enables controlled-variable testing at the PX4 Offboard setpoint boundary. The injector is independent from the observer. AFIO does not read `ai_lag_ms`, injector state, or any private test parameter. It only observes the PX4-facing boundary topics and infers degradation from setpoint freshness, stream jitter, Offboard mode, and vehicle response residuals.​
-
-Real YOLO / VIO / tracking / VLA workloads can later be substituted as the upstream source of delay. The controlled injector simply provides a reproducible way for developers to evaluate their own platform-specific timing margins.
+If `flightResidual` **spikes (Physical tracking divergence imminent)**:
+- Transition into a conservative trajectory mode.
+- Fall back to a lightweight state-estimation pipeline (e.g., pure IMU dead-reckoning).
+- Flag the timestamp for post-flight incident analysis.
 
 ---
 
@@ -222,9 +195,9 @@ Detect when a previously aligned Offboard boundary begins to exhibit structured 
 
 ---
 
-## What AFIO Is Not
+## What OBIO Is Not
 
-AFIO is not a flight controller and does not guarantee flight safety.
+OBIO is not a flight controller and does not guarantee flight safety.
 
 It does not:
 
