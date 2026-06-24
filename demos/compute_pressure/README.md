@@ -35,8 +35,6 @@ Is PX4 still receiving fresh, temporally consistent, physically realizable Offbo
 
 That is the signal an autonomy manager should use before deciding whether to pause loop closure, reduce perception resolution, skip frames, or protect the control publisher.
 
-This is the fastest way to produce an “aha” moment for ROS/PX4 developers.
-
 ## Prerequisites
 
 - ROS 2 Humble or Jazzy
@@ -72,7 +70,7 @@ colcon build --symlink-install --merge-install
 source install/setup.bash
 ```
 
-## Terminal layout for recording
+## Terminal layout
 
 Use two or three terminals:
 
