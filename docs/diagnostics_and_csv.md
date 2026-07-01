@@ -15,10 +15,16 @@ It emits standardized /diagnostics containing sub-millisecond pressure signals (
 
 ### 🎬 See it in action: CPU% missed it. OBIO caught it.
 
-**Scenario C (The Silent Collapse): **
+**Scenario C (The Silent Collapse):**
+
 A synthetic SLAM workload locks the ROS 2 executor. Note how the CPU remains low (~3%), but the control boundary is completely starved. OBIO instantly flags the STALE_STREAM.
 
+<img src="https://raw.githubusercontent.com/ZC502/ai_flight_integrity_observer/main/docs/2026-06-27 16-03-35_HQ.gif" alt=" " width="800" />
+
+
 **Scenario D (Closed-Loop Recovery):**
+
+<img src="https://raw.githubusercontent.com/ZC502/ai_flight_integrity_observer/main/docs/2026-06-27 16-05-01_HQ.gif" alt=" " width="800" />
 1. OBIO emits a boundary-pressure signal (setpointJitterMs spikes).
 2. An external load-shedder catches the signal and reduces the AI contention.
 3. The setpoint stream instantly recovers to GREEN.
